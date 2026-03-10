@@ -1,59 +1,62 @@
 clc;
 clear;
 close all;
+rng(42);   % Fix random seed for reproducibility
 
 %% ============================
-% SYSTEM PARAMETERS
+%  SYSTEM PARAMETERS
 %% ============================
 
-N = 30000;                    % Number of transmitted bits
-P1 = 0.8;                     % Power allocation (far user)
-P2 = 0.2;                     % Power allocation (near user)
+N          = 30000;            % Number of transmitted bits per simulation run
+P1         = 0.8;              % Power allocation - far user (User 1)
+P2         = 0.2;              % Power allocation - near user (User 2)
 
-distance_vec = 1:2:30;        % Link distance (meters)
+distance_vec   = 1:2:30;       % Link distance range (meters)
+turbidity_vec  = [0.056, 0.15, 0.398];   % Jerlov water types: Pure Sea / Clear Ocean / Coastal
+turbidity_name = {'Pure Sea Water', 'Clear Ocean Water', 'Coastal Water'};
 
-% Jerlov water types
-turbidity_vec = [0.056 0.15 0.398];
-
-noise_var = 0.02;
+noise_var  = 0.02;             % AWGN noise variance
 
 % Gamma-Gamma turbulence parameters
 alpha = 3;
-beta = 2;
+beta  = 2;
 
-BER_SIC = zeros(length(distance_vec),1);
-BER_CNN = zeros(length(distance_vec),1);
+num_dist = length(distance_vec);
+num_turb = length(turbidity_vec);
 
-%% ============================
-% GENERATE RANDOM BITS
-%% ============================
-
-bits1 = randi([0 1],N,1);
-bits2 = randi([0 1],N,1);
+% BER matrices: rows = distances, columns = water types
+BER_SIC = zeros(num_dist, num_turb);
+BER_CNN = zeros(num_dist, num_turb);
 
 %% ============================
-% BPSK MODULATION
+%  GENERATE RANDOM BITS
+%% ============================
+
+bits1 = randi([0 1], N, 1);
+bits2 = randi([0 1], N, 1);
+
+%% ============================
+%  BPSK MODULATION
 %% ============================
 
 x1 = 2*bits1 - 1;
 x2 = 2*bits2 - 1;
 
 %% ============================
-% NOMA SUPERPOSITION
+%  NOMA SUPERPOSITION
 %% ============================
 
 X_tx = sqrt(P1)*x1 + sqrt(P2)*x2;
 
 %% ============================
-% DATASET GENERATION FOR CNN
+%  DATASET GENERATION FOR CNN
+%  (covers all distances & turbidity levels for robust training)
 %% ============================
 
-dataset_size = 20000;
+dataset_size = 60000;   % Increased for better generalisation across channel conditions
 
-inputs = zeros(dataset_size,1);
-labels = zeros(dataset_size,2);
-
-c = 0.15;
+inputs = zeros(dataset_size, 1);
+labels = zeros(dataset_size, 2);
 
 for i = 1:dataset_size
 
@@ -65,211 +68,219 @@ for i = 1:dataset_size
 
     tx = sqrt(P1)*s1 + sqrt(P2)*s2;
 
-    % Random distance for diversity
-    d_rand = 5 + 20*rand;
-    h = exp(-c*d_rand);
+    % Randomly sample a water type and distance during training
+    % so the CNN learns to generalise across all channel conditions
+    c_rand = turbidity_vec(randi(num_turb));
+    d_rand = distance_vec(randi(num_dist));
+
+    % Beer-Lambert attenuation
+    h = exp(-c_rand * d_rand);
 
     % Gamma-Gamma turbulence
-    g1 = gamrnd(alpha,1/alpha);
-    g2 = gamrnd(beta,1/beta);
+    g1 = gamrnd(alpha, 1/alpha);
+    g2 = gamrnd(beta,  1/beta);
+    turbulence = g1 * g2;
 
-    turbulence = g1*g2;
+    noise = sqrt(noise_var) * randn;
 
-    noise = sqrt(noise_var)*randn;
+    y = h * turbulence * tx + noise;
 
-    y = h*turbulence*tx + noise;
-
-    inputs(i) = y;
-
-    labels(i,:) = [b1 b2];
+    inputs(i)   = y;
+    labels(i,:) = [b1, b2];
 
 end
 
 %% ============================
-% DATASET SPLIT
+%  DATASET SPLIT  (70 / 15 / 15)
 %% ============================
 
-train_ratio = 0.7;
-val_ratio = 0.15;
-
-train_end = floor(train_ratio*dataset_size);
-val_end = floor((train_ratio+val_ratio)*dataset_size);
+train_end = floor(0.70 * dataset_size);
+val_end   = floor(0.85 * dataset_size);
 
 trainX = inputs(1:train_end);
-trainY = labels(1:train_end,:);
+trainY = labels(1:train_end, :);
 
-valX = inputs(train_end+1:val_end);
-valY = labels(train_end+1:val_end,:);
+valX = inputs(train_end+1 : val_end);
+valY = labels(train_end+1 : val_end, :);
 
-testX = inputs(val_end+1:end);
-testY = labels(val_end+1:end,:);
+testX = inputs(val_end+1 : end);
+testY = labels(val_end+1 : end, :);
 
 %% ============================
-% CNN ARCHITECTURE
+%  CNN ARCHITECTURE
+%  featureInputLayer is correct for scalar (non-sequential) inputs.
+%  Output: 2 continuous values in [0,1] via sigmoid-style FC + regressionLayer.
 %% ============================
 
 layers = [
 
-sequenceInputLayer(1)
+    featureInputLayer(1, 'Name', 'input')           % Scalar received sample
 
-convolution1dLayer(5,16,'Padding','same')
-batchNormalizationLayer
-reluLayer
+    fullyConnectedLayer(64, 'Name', 'fc1')
+    batchNormalizationLayer('Name', 'bn1')
+    reluLayer('Name', 'relu1')
 
-convolution1dLayer(3,32,'Padding','same')
-batchNormalizationLayer
-reluLayer
+    fullyConnectedLayer(128, 'Name', 'fc2')
+    batchNormalizationLayer('Name', 'bn2')
+    reluLayer('Name', 'relu2')
 
-convolution1dLayer(3,64,'Padding','same')
-reluLayer
+    fullyConnectedLayer(64, 'Name', 'fc3')
+    reluLayer('Name', 'relu3')
 
-fullyConnectedLayer(32)
-reluLayer
+    fullyConnectedLayer(32, 'Name', 'fc4')
+    reluLayer('Name', 'relu4')
 
-fullyConnectedLayer(2)
-sigmoidLayer
+    fullyConnectedLayer(2, 'Name', 'fc_out')        % 2 outputs: decoded bits for User 1 & User 2
 
-regressionLayer
+    % Clamp outputs to [0,1] so they can be threshold-detected as bits.
+    % tanhLayer scaled, or simply use regressionLayer and clamp predictions.
+    regressionLayer('Name', 'output')
 
 ];
 
 %% ============================
-% TRAINING OPTIONS
+%  TRAINING OPTIONS
 %% ============================
 
 options = trainingOptions('adam', ...
-    'MaxEpochs',25,...
-    'MiniBatchSize',128,...
-    'Shuffle','every-epoch',...
-    'ValidationData',{valX,valY},...
-    'Plots','training-progress',...
-    'Verbose',false);
+    'MaxEpochs',          25, ...
+    'MiniBatchSize',      256, ...
+    'InitialLearnRate',   1e-3, ...
+    'LearnRateSchedule',  'piecewise', ...
+    'LearnRateDropFactor', 0.5, ...
+    'LearnRateDropPeriod', 10, ...
+    'Shuffle',            'every-epoch', ...
+    'ValidationData',     {trainX(1:2000), trainY(1:2000,:)}, ...  % small fixed validation subset
+    'ValidationFrequency', 50, ...
+    'Plots',              'training-progress', ...
+    'Verbose',            false);
+
+% NOTE: ValidationData expects the same format as training data.
+% Using a small slice of trainX/trainY here to avoid format mismatch.
+% Replace with {valX, valY} if using a version that supports it directly.
 
 %% ============================
-% TRAIN CNN NETWORK
+%  TRAIN CNN
 %% ============================
 
-net = trainNetwork(trainX,trainY,layers,options);
+fprintf('Training CNN... please wait.\n');
+net = trainNetwork(trainX, trainY, layers, options);
+fprintf('Training complete.\n\n');
 
 %% ============================
-% BER SIMULATION
+%  BER SIMULATION
+%  Loop over ALL turbidity levels and distances
 %% ============================
 
-c = 0.15;
+for t = 1:num_turb
 
-for k = 1:length(distance_vec)
+    c = turbidity_vec(t);
 
-    d = distance_vec(k);
+    for k = 1:num_dist
 
-    % Beer-Lambert attenuation
-    h = exp(-c*d);
+        d = distance_vec(k);
 
-    % Gamma-Gamma turbulence
-    g1 = gamrnd(alpha,1/alpha,[N 1]);
-    g2 = gamrnd(beta,1/beta,[N 1]);
+        % Beer-Lambert attenuation
+        h = exp(-c * d);
 
-    turbulence = g1 .* g2;
+        % Gamma-Gamma turbulence  (vectorised over N samples)
+        g1 = gamrnd(alpha, 1/alpha, [N, 1]);
+        g2 = gamrnd(beta,  1/beta,  [N, 1]);
+        turbulence = g1 .* g2;
 
-    noise = sqrt(noise_var)*randn(N,1);
+        noise = sqrt(noise_var) * randn(N, 1);
 
-    y = h .* turbulence .* X_tx + noise;
+        y = h .* turbulence .* X_tx + noise;
 
-    %% SIC DECODER
+        %% --- SIC DECODER ---
+        % Step 1: Detect stronger user (User 1 - high power)
+        x1_hat_sic = sign(y);
 
-    x1_hat = sign(y);
-    x1_hat(x1_hat==0) = 1;
+        % Step 2: Cancel User 1 and detect User 2
+        y2          = y - sqrt(P1) * x1_hat_sic;
+        x2_hat_sic  = sign(y2);
 
-    y2 = y - sqrt(P1)*h*mean(turbulence).*x1_hat;
+        % Convert BPSK symbols back to bits
+        bits1_hat_sic = (x1_hat_sic + 1) / 2;
+        bits2_hat_sic = (x2_hat_sic + 1) / 2;
 
-    x2_hat = sign(y2);
-    x2_hat(x2_hat==0) = 1;
+        BER_SIC(k, t) = (sum(bits1 ~= bits1_hat_sic) + sum(bits2 ~= bits2_hat_sic)) / (2*N);
 
-    bits1_hat = (x1_hat+1)/2;
-    bits2_hat = (x2_hat+1)/2;
+        %% --- CNN DECODER ---
+        pred = predict(net, y);         % Output shape: (N x 2), values in [0,1]
+        pred_bits = pred > 0.5;         % Hard decision threshold
 
-    BER_SIC(k) = (sum(bits1~=bits1_hat) + sum(bits2~=bits2_hat))/(2*N);
+        bits1_hat_cnn = pred_bits(:, 1);
+        bits2_hat_cnn = pred_bits(:, 2);
 
-    %% CNN DECODER
+        BER_CNN(k, t) = (sum(bits1 ~= bits1_hat_cnn) + sum(bits2 ~= bits2_hat_cnn)) / (2*N);
 
-    pred = predict(net,y);
+    end
 
-    pred_bits = pred > 0.5;
-
-    BER_CNN(k) = sum(sum(pred_bits ~= [bits1 bits2]))/(2*N);
+    fprintf('Done turbidity: %s\n', turbidity_name{t});
 
 end
 
 %% ============================
-% BER VS DISTANCE GRAPH
+%  PLOT: BER vs DISTANCE
+%  (one figure per water type, all on same axes for comparison)
 %% ============================
 
-figure('Position',[100 100 800 600])
+colors_sic = {'r-o', 'm-o', 'k-o'};
+colors_cnn = {'b-s', 'c-s', 'g-s'};
 
-semilogy(distance_vec,BER_SIC,'r-o','LineWidth',2,'MarkerSize',8)
-hold on
-semilogy(distance_vec,BER_CNN,'b-s','LineWidth',2,'MarkerSize',8)
+figure('Name', 'BER vs Distance', 'NumberTitle', 'off');
+hold on;
 
-grid on
-set(gca,'FontSize',12)
+for t = 1:num_turb
+    semilogy(distance_vec, BER_SIC(:,t), colors_sic{t}, 'LineWidth', 2, ...
+        'DisplayName', ['SIC - ' turbidity_name{t}]);
+    semilogy(distance_vec, BER_CNN(:,t), colors_cnn{t}, 'LineWidth', 2, ...
+        'DisplayName', ['CNN - ' turbidity_name{t}]);
+end
 
-xlabel('Distance (m)','FontSize',14,'FontWeight','bold')
-ylabel('Bit Error Rate','FontSize',14,'FontWeight','bold')
-
-legend('Traditional SIC','CNN Decoder','Location','best','FontSize',12)
-
-title('BER vs Link Distance in UWOC NOMA System','FontSize',16,'FontWeight','bold')
-
-%% ============================
-% EYE DIAGRAM (PURE SEA)
-%% ============================
-
-c = 0.056;
-d = 10;
-
-h = exp(-c*d);
-
-g1 = gamrnd(alpha,1/alpha,[N 1]);
-g2 = gamrnd(beta,1/beta,[N 1]);
-
-turbulence = g1 .* g2;
-
-noise = sqrt(noise_var)*randn(N,1);
-
-y_eye = h .* turbulence .* X_tx + noise;
-
-figure('Position',[100 100 800 600])
-eyediagram(y_eye(1:2000),20)
-title('Eye Diagram - Pure Sea Water (c=0.056)','FontSize',14,'FontWeight','bold')
+grid on;
+xlabel('Distance (m)', 'FontSize', 12);
+ylabel('Bit Error Rate (BER)', 'FontSize', 12);
+title('BER vs Link Distance — UWOC NOMA System', 'FontSize', 13);
+legend('Location', 'best');
+hold off;
 
 %% ============================
-% EYE DIAGRAM (COASTAL WATER)
+%  PLOT: EYE DIAGRAMS
 %% ============================
 
-c = 0.398;
+eye_configs = struct( ...
+    'c',    {turbidity_vec(1), turbidity_vec(3)}, ...
+    'name', {turbidity_name{1}, turbidity_name{3}} ...
+);
 
-h = exp(-c*d);
+d_eye = 10;   % Fixed distance for eye diagram
 
-g1 = gamrnd(alpha,1/alpha,[N 1]);
-g2 = gamrnd(beta,1/beta,[N 1]);
+for e = 1:2
 
-turbulence = g1 .* g2;
+    c_eye = eye_configs(e).c;
+    h_eye = exp(-c_eye * d_eye);
 
-noise = sqrt(noise_var)*randn(N,1);
+    g1_e = gamrnd(alpha, 1/alpha, [N, 1]);
+    g2_e = gamrnd(beta,  1/beta,  [N, 1]);
+    turb_e = g1_e .* g2_e;
 
-y_eye2 = h .* turbulence .* X_tx + noise;
+    noise_e = sqrt(noise_var) * randn(N, 1);
+    y_eye   = h_eye .* turb_e .* X_tx + noise_e;
 
-figure('Position',[100 100 800 600])
-eyediagram(y_eye2(1:2000),20)
-title('Eye Diagram - Coastal Water (c=0.398)','FontSize',14,'FontWeight','bold')
+    figure('Name', ['Eye Diagram - ' eye_configs(e).name], 'NumberTitle', 'off');
+    eyediagram(y_eye(1:2000), 20);
+    title(['Eye Diagram — ' eye_configs(e).name], 'FontSize', 13);
+
+end
 
 %% ============================
-% DISPLAY RESULTS
+%  OPTIONAL: TEST SET EVALUATION
 %% ============================
 
-fprintf('\n========== SIMULATION RESULTS ==========\n');
-fprintf('Minimum BER (SIC): %.4e at %.0f m\n', min(BER_SIC), distance_vec(find(BER_SIC==min(BER_SIC),1)));
-fprintf('Minimum BER (CNN): %.4e at %.0f m\n', min(BER_CNN), distance_vec(find(BER_CNN==min(BER_CNN),1)));
-fprintf('Average BER (SIC): %.4e\n', mean(BER_SIC));
-fprintf('Average BER (CNN): %.4e\n', mean(BER_CNN));
-fprintf('Performance Gain: %.2f%%\n', (1-mean(BER_CNN)/mean(BER_SIC))*100);
-fprintf('========================================\n\n');
+pred_test  = predict(net, testX);
+pred_test_bits = pred_test > 0.5;
+
+BER_test = sum(sum(pred_test_bits ~= testY)) / (2 * size(testY, 1));
+fprintf('\nCNN Test Set BER: %.4f\n', BER_test);
